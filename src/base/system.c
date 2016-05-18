@@ -1,5 +1,9 @@
 /* (c) Magnus Auvinen. See licence.txt in the root of the distribution for more information. */
 /* If you are missing that file, acquire a complete release at teeworlds.com.                */
+#if defined(__LINUX__) || defined(__linux__)
+#define _GNU_SOURCE // recvmmsg & sendmmsg
+#endif
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -89,6 +93,24 @@ static NETSTATS network_stats = {0};
 static MEMSTATS memory_stats = {0};
 
 static NETSOCKET invalid_socket = {NETTYPE_INVALID, -1, -1};
+
+#if defined(CONF_PLATFORM_LINUX)
+#define VLEN 64
+#define BUFSIZE 1400
+static struct mmsghdr msgs[VLEN];
+static struct iovec iovecs[VLEN];
+static char sockaddrs[VLEN][128];
+static unsigned char bufs[VLEN][BUFSIZE];
+static int retval = 0;
+static int curpos = 0;
+
+#define VLEN_OUT 64
+static struct mmsghdr msgs_out[VLEN_OUT];
+static struct iovec iovecs_out[VLEN_OUT];
+static char sockaddrs_out[VLEN_OUT][128];
+static unsigned char bufs_out[VLEN_OUT][BUFSIZE];
+static int curpos_out = 0;
+#endif
 
 #define AF_WEBSOCKET_INET (0xee)
 
@@ -1184,6 +1206,10 @@ NETSOCKET net_udp_create(NETADDR bindaddr)
 	return sock;
 }
 
+int net_udp_flush(NETSOCKET sock)
+{
+}
+
 int net_udp_send(NETSOCKET sock, const NETADDR *addr, const void *data, int size)
 {
 #ifndef FUZZING
@@ -1210,16 +1236,6 @@ int net_udp_send(NETSOCKET sock, const NETADDR *addr, const void *data, int size
 			dbg_msg("net", "can't send ipv4 traffic to this socket");
 	}
 
-#if defined(WEBSOCKETS)
-	if(addr->type&NETTYPE_WEBSOCKET_IPV4)
-	{
-		if(sock.web_ipv4sock >= 0)
-			d = websocket_send(sock.web_ipv4sock, (const unsigned char*)data, size, addr->port);
-		else
-			dbg_msg("net", "can't send websocket_ipv4 traffic to this socket");
-	}
-#endif
-
 	if(addr->type&NETTYPE_IPV6)
 	{
 		if(sock.ipv6sock >= 0)
@@ -1242,6 +1258,17 @@ int net_udp_send(NETSOCKET sock, const NETADDR *addr, const void *data, int size
 		else
 			dbg_msg("net", "can't send ipv6 traffic to this socket");
 	}
+
+#if defined(WEBSOCKETS)
+	if(addr->type&NETTYPE_WEBSOCKET_IPV4)
+	{
+		if(sock.web_ipv4sock >= 0)
+			d = websocket_send(sock.web_ipv4sock, (const unsigned char*)data, size, addr->port);
+		else
+			dbg_msg("net", "can't send websocket_ipv4 traffic to this socket");
+	}
+#endif
+
 	/*
 	else
 		dbg_msg("net", "can't send to network of type %d", addr->type);
@@ -1269,10 +1296,38 @@ int net_udp_send(NETSOCKET sock, const NETADDR *addr, const void *data, int size
 int net_udp_recv(NETSOCKET sock, NETADDR *addr, void *data, int maxsize)
 {
 #ifndef FUZZING
+	char *sockaddrbuf;
+	int bytes = 0;
+#if defined(CONF_PLATFORM_LINUX)
+	if(curpos >= retval)
+	{
+		retval = 0;
+	}
+
+	if(retval <= 0 && sock.ipv4sock >= 0)
+	{
+		retval = recvmmsg(sock.ipv4sock, msgs, VLEN, 0, NULL);
+		curpos = 0;
+	}
+
+	if(retval <= 0 && sock.ipv6sock >= 0)
+	{
+		retval = recvmmsg(sock.ipv6sock, msgs, VLEN, 0, NULL);
+		if(retval > -1)
+		curpos = 0;
+	}
+
+	if(curpos < retval)
+	{
+		bytes = msgs[curpos].msg_len;
+		mem_copy(data, bufs[curpos], bytes);
+		sockaddrbuf = sockaddrs[curpos];
+		msgs[curpos].msg_hdr.msg_namelen = 128; // gets changed by recvmmsg!
+		curpos++;
+	}
+#else
 	char sockaddrbuf[128];
 	socklen_t fromlen;// = sizeof(sockaddrbuf);
-	int bytes = 0;
-
 	if(bytes == 0 && sock.ipv4sock >= 0)
 	{
 		fromlen = sizeof(struct sockaddr_in);
@@ -1284,6 +1339,7 @@ int net_udp_recv(NETSOCKET sock, NETADDR *addr, void *data, int maxsize)
 		fromlen = sizeof(struct sockaddr_in6);
 		bytes = recvfrom(sock.ipv6sock, (char*)data, maxsize, 0, (struct sockaddr *)&sockaddrbuf, &fromlen);
 	}
+#endif
 
 #if defined(WEBSOCKETS)
 	if(bytes <= 0 && sock.web_ipv4sock >= 0)
@@ -1297,6 +1353,8 @@ int net_udp_recv(NETSOCKET sock, NETADDR *addr, void *data, int maxsize)
 	if(bytes > 0)
 	{
 		sockaddr_to_netaddr((struct sockaddr *)&sockaddrbuf, addr);
+		char addr_str[NETADDR_MAXSTRSIZE];
+		net_addr_str(addr, addr_str, sizeof(addr_str), 0);
 		network_stats.recv_bytes += bytes;
 		network_stats.recv_packets++;
 		return bytes;
@@ -1563,6 +1621,19 @@ int net_init()
 	int err = WSAStartup(MAKEWORD(1, 1), &wsaData);
 	dbg_assert(err == 0, "network initialization failed.");
 	return err==0?0:1;
+#elif defined(CONF_PLATFORM_LINUX)
+	int i;
+	mem_zero(msgs, sizeof(msgs));
+	mem_zero(sockaddrs, sizeof(sockaddrs));
+	for(i = 0; i < VLEN; i++)
+	{
+		iovecs[i].iov_base = bufs[i];
+		iovecs[i].iov_len = BUFSIZE;
+		msgs[i].msg_hdr.msg_iov = &iovecs[i];
+		msgs[i].msg_hdr.msg_iovlen = 1;
+		msgs[i].msg_hdr.msg_name = sockaddrs[i];
+		msgs[i].msg_hdr.msg_namelen = 128;
+	}
 #endif
 
 	return 0;
